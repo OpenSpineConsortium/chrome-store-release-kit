@@ -1,0 +1,60 @@
+name: CI
+
+# The kit's own check: its suites, then its two actions run against the
+# fixture extension, with no secret, so a pull request here tries the
+# very steps every caller's release runs. The store step says "Not
+# configured" and passes, which proves the wiring and sends nothing.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  kit:
+    runs-on: ubuntu-latest
+    env:
+      # The packager minifies with the esbuild installed below (the version
+      # package.mjs pins); named here so no npx download happens in CI.
+      RELEASE_KIT_ESBUILD: esbuild
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The whole history: the kit numbers the build by the commit count.
+          fetch-depth: 0
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install the esbuild the packager pins
+        run: npm install -g esbuild@0.25.11
+
+      - name: The kit's suites
+        run: node --test "release-kit/tests/*.test.js"
+
+      - name: Package the fixture through the kit's action
+        id: kit
+        uses: ./release-kit
+        with:
+          name: kit-fixture
+          dir: tests/fixture/extension
+
+      - name: The store step, not configured
+        uses: ./release-kit/store
+        with:
+          zip: ${{ steps.kit.outputs.zip }}
+
+      - name: Keep the fixture's zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: kit-fixture-chrome
+          path: |
+            ${{ steps.kit.outputs.dir }}/*.zip
+            ${{ steps.kit.outputs.dir }}/*.zip.sha256
+          if-no-files-found: error
