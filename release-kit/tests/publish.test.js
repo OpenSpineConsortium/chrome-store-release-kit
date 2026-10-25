@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const pub = await import(pathToFileURL(path.join(HERE, '..', 'store', 'publish.mjs')).href);
+const lib = await import(pathToFileURL(path.join(HERE, '..', 'lib.mjs')).href);
 
 const ITEM = 'abcdefghijklmnopabcdefghijklmnop';
 const PUBLISHER = 'a1b2c3d4-publisher';
@@ -24,6 +25,9 @@ const TOKEN = 'ya29.access-token-access-token';
 const ZIP = Buffer.from('PK\x03\x04 not really a zip but it starts like one');
 // What sha256sum prints for ZIP, so the test does not trust the function under test.
 const ZIP_SHA256 = '7cc8f9bb1bdfe888be8ef5abdec5d98ecd18f9f6e404a7372f4efa123a1659d6';
+// A real zip whose manifest names a build, for the runs that read it.
+const BUILD = '25.0.0.125';
+const BUILD_ZIP = lib.zip([['manifest.json', Buffer.from(JSON.stringify({ manifest_version: 3, name: 'x', version: BUILD }))]]);
 
 // A fetch that answers each URL from a script and records what was sent.
 function fakeFetch(answers) {
@@ -42,13 +46,14 @@ const tokenOk = { match: u => u === pub.TOKEN_URL, body: { access_token: TOKEN, 
 const isUpload = (u, i) => i.method === 'POST' && u.endsWith(':upload');
 const isPublish = (u, i) => i.method === 'POST' && u.endsWith(':publish');
 const isStatus = (u, i) => i.method === 'GET' && u.endsWith(':fetchStatus');
+const isCancel = (u, i) => i.method === 'POST' && u.endsWith(':cancelSubmission');
 
-function harness(answers, env = ENV) {
+function harness(answers, env = ENV, zipBytes = ZIP) {
   const lines = [];
   const sleeps = [];
   const { fetch, calls } = fakeFetch(answers);
   const log = line => lines.push(String(line));
-  const readFile = () => ZIP;
+  const readFile = () => zipBytes;
   const sleep = async ms => { sleeps.push(ms); };
   return { run: argv => pub.run({ argv, env, fetch, log, readFile, sleep }), lines, calls, sleeps };
 }
@@ -86,7 +91,12 @@ test('the requests are the ones the Chrome Web Store API V2 documents', () => {
   const s = pub.statusRequest(NAME, TOKEN);
   assert.equal(s.url, `https://chromewebstore.googleapis.com/v2/${NAME}:fetchStatus`);
   assert.equal(s.init.method, 'GET');
-  for (const req of [u, p, staged, s]) assert.ok(!req.url.includes('v1.1'), 'never the V1 API, which ends on 15 October 2026');
+
+  const c = pub.cancelRequest(NAME, TOKEN);
+  assert.equal(c.url, `https://chromewebstore.googleapis.com/v2/${NAME}:cancelSubmission`);
+  assert.equal(c.init.method, 'POST');
+  assert.equal(c.init.body, undefined, 'an empty request, as CancelSubmissionRequest has no fields');
+  for (const req of [u, p, staged, s, c]) assert.ok(!req.url.includes('v1.1'), 'never the V1 API, which ends on 15 October 2026');
 });
 
 test('the store\'s answers become sentences that say what to do', () => {
@@ -156,15 +166,114 @@ test('upload then publish: token, upload, publish, and the log keeps no secret',
 });
 
 test('a refused upload stops before any publish, with the store\'s reason', async () => {
-  const h = harness([
-    tokenOk,
-    { match: isUpload, status: 400, body: { error: { code: 400, message: 'Version number in manifest must be greater than 0.2.0', status: 'INVALID_ARGUMENT' } } },
-  ]);
+  const refused = { match: isUpload, status: 400, body: { error: { code: 400, message: 'Version number in manifest must be greater than 0.2.0', status: 'INVALID_ARGUMENT' } } };
+  const h = harness([tokenOk, refused, { match: isStatus, body: { publishedItemRevisionStatus: { state: 'PUBLISHED', distributionChannels: [{ crxVersion: '0.2.0' }] } } }], ENV, BUILD_ZIP);
   assert.equal(await h.run(['--upload', '--zip', 'x.zip', '--publish']), 1);
-  assert.equal(h.calls.length, 2, 'no publish after a refused upload');
+  assert.deepEqual(h.calls.map(c => c.url.replace(/^.*[:/]/, '')), ['token', 'upload', 'fetchStatus'], 'the item is read to say why; no withdrawal and no publish');
   assert.match(h.lines.join('\n'), /HTTP 400: Version number in manifest must be greater than 0\.2\.0/);
   assert.match(h.lines.join('\n'), /raise the version in the manifest/);
   noSecretLeaks(h.lines);
+  // An item that cannot be read leaves the refusal as the store said it.
+  const unread = harness([tokenOk, refused, { match: isStatus, status: 500, body: { error: { message: 'backend error' } } }], ENV, BUILD_ZIP);
+  assert.equal(await unread.run(['--upload', '--zip', 'x.zip', '--publish']), 1);
+  assert.equal(unread.calls.filter(c => isCancel(c.url, c.init) || isPublish(c.url, c.init)).length, 0);
+  assert.match(unread.lines.join('\n'), /HTTP 400: Version number.*raise the version in the manifest/);
+});
+
+// The store's refusal while a review is under way, as it said it on 2026-10-25.
+const IN_REVIEW = { error: { code: 400, message: 'You may not edit or publish an item that is in review.', status: 'FAILED_PRECONDITION' } };
+const reviewOf = version => ({ submittedItemRevisionStatus: { state: 'PENDING_REVIEW', distributionChannels: [{ crxVersion: version }] }, publishedItemRevisionStatus: { state: 'PUBLISHED', distributionChannels: [{ crxVersion: '24.1.0.120' }] } });
+// An upload refused while the review stands and taken once it is withdrawn.
+function uploadAfterWithdrawal(second = { body: { name: NAME, itemId: ITEM, crxVersion: BUILD, uploadState: 'SUCCEEDED' } }) {
+  let withdrawn = false;
+  const answers = [
+    { match: (u, i) => { if (!isCancel(u, i)) return false; withdrawn = true; return true; }, body: {} },
+    { match: (u, i) => isUpload(u, i) && !withdrawn, status: 400, body: IN_REVIEW },
+    { match: (u, i) => isUpload(u, i) && withdrawn, ...second },
+  ];
+  return answers;
+}
+
+test('an older version in review is withdrawn and this build submitted in its place', async () => {
+  const h = harness([tokenOk, ...uploadAfterWithdrawal(), { match: isStatus, body: reviewOf('24.2.0.124') }, { match: isPublish, body: { name: NAME, state: 'PENDING_REVIEW' } }], ENV, BUILD_ZIP);
+  assert.equal(await h.run(['--upload', '--zip', 'x.zip', '--publish']), 0);
+  assert.deepEqual(h.calls.map(c => c.url.replace(/^.*[:/]/, '')), ['token', 'upload', 'fetchStatus', 'cancelSubmission', 'upload', 'publish']);
+  assert.equal(h.calls[4].init.body, BUILD_ZIP, 'the same bytes, sent once more');
+  const log = h.lines.join('\n');
+  assert.match(log, /HTTP 400: You may not edit or publish an item that is in review\./, 'the store\'s own words');
+  assert.match(log, /Version 24\.2\.0\.124 is in review; withdrawing that submission so this build \(25\.0\.0\.125\) is submitted in its place/);
+  assert.match(log, /The review of 24\.2\.0\.124 is withdrawn\./);
+  assert.match(log, /new draft \(version 25\.0\.0\.125\)/);
+  assert.match(log, /submitted for review/);
+  noSecretLeaks(h.lines);
+});
+
+test('a review is left alone where the run does not submit, the build is not newer, or a version cannot be read', async () => {
+  const refusedInReview = { match: isUpload, status: 400, body: IN_REVIEW };
+  const neverCancelled = calls => assert.equal(calls.filter(c => isCancel(c.url, c.init)).length, 0, 'no withdrawal');
+  // Only an upload: withdrawing would leave nothing in review.
+  const only = harness([tokenOk, refusedInReview, { match: isStatus, body: reviewOf('24.2.0.124') }], ENV, BUILD_ZIP);
+  assert.equal(await only.run(['--upload', '--zip', 'x.zip']), 1);
+  neverCancelled(only.calls);
+  assert.match(only.lines.join('\n'), /Version 24\.2\.0\.124 is in review.*This run does not submit.*release again with publish ticked/);
+  // The version in review is this one or a later one.
+  for (const later of [BUILD, '25.0.0.126', '26.0.0']) {
+    const h = harness([tokenOk, refusedInReview, { match: isStatus, body: reviewOf(later) }], ENV, BUILD_ZIP);
+    assert.equal(await h.run(['--upload', '--zip', 'x.zip', '--publish']), 1, later);
+    neverCancelled(h.calls);
+    assert.match(h.lines.join('\n'), /this build \(25\.0\.0\.125\) is not above it, so that review is left alone/);
+  }
+  // The store names no version for the review.
+  const unnamed = harness([tokenOk, refusedInReview, { match: isStatus, body: { submittedItemRevisionStatus: { state: 'PENDING_REVIEW' } } }], ENV, BUILD_ZIP);
+  assert.equal(await unnamed.run(['--upload', '--zip', 'x.zip', '--publish']), 1);
+  neverCancelled(unnamed.calls);
+  assert.match(unnamed.lines.join('\n'), /Version \(not named\) is in review.*cannot be set beside it/);
+  // The zip's own version cannot be read.
+  const opaque = harness([tokenOk, refusedInReview, { match: isStatus, body: reviewOf('24.2.0.124') }]);
+  assert.equal(await opaque.run(['--upload', '--zip', 'x.zip', '--publish']), 1);
+  neverCancelled(opaque.calls);
+  assert.match(opaque.lines.join('\n'), /this build's version \(unreadable\) cannot be set beside it/);
+});
+
+test('after a withdrawal, every stop says nothing is in review now', async () => {
+  const review = { match: isStatus, body: reviewOf('24.2.0.124') };
+  const said = /The review of 24\.2\.0\.124 was withdrawn, so nothing is in review now/;
+  // The store will not withdraw it: the run ends there and uploads nothing more.
+  const kept = harness([tokenOk, { match: isUpload, status: 400, body: IN_REVIEW }, review, { match: isCancel, status: 403, body: { error: { message: 'The caller does not have permission' } } }], ENV, BUILD_ZIP);
+  assert.equal(await kept.run(['--upload', '--zip', 'x.zip', '--publish']), 1);
+  assert.deepEqual(kept.calls.map(c => c.url.replace(/^.*[:/]/, '')), ['token', 'upload', 'fetchStatus', 'cancelSubmission']);
+  assert.match(kept.lines.join('\n'), /did not withdraw the review of 24\.2\.0\.124 \(HTTP 403: The caller does not have permission\)/);
+  assert.doesNotMatch(kept.lines.join('\n'), said);
+  // The upload is refused again once the review is withdrawn.
+  const again = harness([tokenOk, ...uploadAfterWithdrawal({ status: 400, body: { error: { message: 'Package is invalid' } } }), review], ENV, BUILD_ZIP);
+  assert.equal(await again.run(['--upload', '--zip', 'x.zip', '--publish']), 1);
+  assert.equal(again.calls.filter(c => isUpload(c.url, c.init)).length, 2, 'once more, not a loop');
+  assert.equal(again.calls.filter(c => isPublish(c.url, c.init)).length, 0);
+  assert.match(again.lines.join('\n'), /HTTP 400: Package is invalid/);
+  assert.match(again.lines.join('\n'), said);
+  // The submission is refused, as it is while a permission's reason is unanswered.
+  const unsent = harness([tokenOk, ...uploadAfterWithdrawal(), review, { match: isPublish, status: 400, body: { error: { message: 'Item has missing fields' } } }], ENV, BUILD_ZIP);
+  assert.equal(await unsent.run(['--upload', '--zip', 'x.zip', '--publish']), 1);
+  assert.match(unsent.lines.join('\n'), /refused the submission \(HTTP 400: Item has missing fields\)/);
+  assert.match(unsent.lines.join('\n'), said);
+  noSecretLeaks([...kept.lines, ...again.lines, ...unsent.lines]);
+});
+
+test('versions: the one in review, the zip\'s own, and their order', () => {
+  assert.equal(pub.versionInReview(reviewOf('24.2.0.124')), '24.2.0.124');
+  assert.equal(pub.versionInReview({ submittedItemRevisionStatus: { state: 'PENDING_REVIEW', distributionChannels: [{}, { crxVersion: '1.2' }] } }), '1.2');
+  assert.equal(pub.versionInReview({ submittedItemRevisionStatus: { state: 'PENDING_REVIEW' } }), '');
+  for (const state of ['STAGED', 'CANCELLED', 'REJECTED', 'PUBLISHED']) assert.equal(pub.versionInReview({ submittedItemRevisionStatus: { state, distributionChannels: [{ crxVersion: '1.0' }] } }), null, state);
+  assert.equal(pub.versionInReview({}), null);
+  assert.equal(pub.versionInReview(null), null);
+  assert.equal(pub.zipVersion(BUILD_ZIP), BUILD);
+  assert.equal(pub.zipVersion(ZIP), '', 'not a zip it can read');
+  assert.equal(pub.zipVersion(lib.zip([['manifest.json', Buffer.from('{"version":"1.02"}')]])), '', 'not a version Chrome takes');
+  assert.equal(pub.zipVersion(lib.zip([['other.json', Buffer.from('{}')]])), '', 'no manifest');
+  assert.ok(pub.compareVersions('25.0.0.125', '24.2.0.124') > 0);
+  assert.ok(pub.compareVersions('25.0.0.125', '25.0.0.126') < 0);
+  assert.ok(pub.compareVersions('1.10', '1.9') > 0, 'by number, not by text');
+  assert.equal(pub.compareVersions('1.0', '1.0.0.0'), 0, 'a missing part counts as 0');
 });
 
 test('a package the store is still processing: done as an upload, waited for within bounds before a publish', async () => {
@@ -227,6 +336,13 @@ test('--dry-run names the requests and sends nothing; --status reads the item', 
   assert.match(dry.lines.join('\n'), new RegExp(`POST https://chromewebstore\\.googleapis\\.com/upload/v2/${NAME}:upload`));
   assert.match(dry.lines.join('\n'), /:publish \(STAGED_PUBLISH\)/);
   assert.match(dry.lines.join('\n'), new RegExp(`SHA-256 ${ZIP_SHA256}\\)`));
+  assert.match(dry.lines.join('\n'), /:cancelSubmission and the upload again, only if an older version than this build is in review/);
+  const dryBuild = harness([], ENV, BUILD_ZIP);
+  assert.equal(await dryBuild.run(['--upload', '--zip', 'x.zip', '--publish', '--dry-run']), 0);
+  assert.match(dryBuild.lines.join('\n'), /only if an older version than 25\.0\.0\.125 is in review/);
+  const dryUpload = harness([]);
+  assert.equal(await dryUpload.run(['--upload', '--zip', 'x.zip', '--dry-run']), 0);
+  assert.doesNotMatch(dryUpload.lines.join('\n'), /cancelSubmission/, 'a run that only uploads never withdraws');
   const st = harness([tokenOk, { match: isStatus, body: { publishedItemRevisionStatus: { state: 'PUBLISHED' }, lastAsyncUploadState: 'SUCCEEDED' } }]);
   assert.equal(await st.run(['--status']), 0);
   assert.match(st.lines.join('\n'), /published PUBLISHED, submitted none, last upload SUCCEEDED/);
