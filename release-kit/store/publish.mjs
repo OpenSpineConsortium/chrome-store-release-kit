@@ -17,6 +17,10 @@
 //
 // Nothing here retries: an upload the store refuses ends the run with the
 // store's own words and what to do next, and the person decides. The one
+// exception is a review under way, during which the store takes no
+// upload: where an older version is in review and the run submits, that
+// review is withdrawn and the upload made once more, so a newer build
+// takes the older one's place (the owner's rule of 2026-10-25). The one
 // wait is bounded and says each step: an upload the store is still
 // processing is given UPLOAD_WAITS to settle before a publish that was
 // asked for, and the run ends with the way on if it does not. No
@@ -28,6 +32,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isVersion, unzip } from '../lib.mjs';
 
 export const SECRET_NAMES = Object.freeze(['CWS_CLIENT_ID', 'CWS_CLIENT_SECRET', 'CWS_REFRESH_TOKEN']);
 export const ID_NAMES = Object.freeze(['CWS_PUBLISHER_ID', 'CWS_ITEM_ID']);
@@ -116,6 +121,46 @@ export function statusRequest(name, token) {
   return { url: `${API_BASE}/v2/${name}:fetchStatus`, init: { method: 'GET', headers: { authorization: `Bearer ${token}` } } };
 }
 
+// Withdraws the submission under review; the request and the answer are
+// both empty, as the publish's are.
+export function cancelRequest(name, token) {
+  return { url: `${API_BASE}/v2/${name}:cancelSubmission`, init: { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-length': '0' } } };
+}
+
+// What fetchStatus says is under review: null when nothing is, else the
+// version the store names for it, or '' when it names none.
+export function versionInReview(body) {
+  const submitted = body && body.submittedItemRevisionStatus;
+  if (!submitted || submitted.state !== 'PENDING_REVIEW') return null;
+  const channels = Array.isArray(submitted.distributionChannels) ? submitted.distributionChannels : [];
+  const named = channels.find(c => c && typeof c.crxVersion === 'string' && c.crxVersion);
+  return named ? named.crxVersion : '';
+}
+
+// The version in the zip's own manifest, the one the store will read, or
+// '' when the zip or its manifest cannot be read.
+export function zipVersion(bytes) {
+  try {
+    const manifest = unzip(Buffer.from(bytes)).get('manifest.json');
+    const version = manifest ? JSON.parse(manifest.toString('utf8')).version : '';
+    return isVersion(version) ? version : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// Above zero when a is the higher version, as Chrome orders them: part by
+// part, a missing part counting as 0.
+export function compareVersions(a, b) {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d;
+  }
+  return 0;
+}
+
 // What a refused upload usually means, and the two ways past it.
 const VERSION_ADVICE = 'The usual cause is a version not above the published one: raise the version in the manifest, or push to the default branch again for a new build number, and release again.';
 
@@ -189,6 +234,7 @@ export const USAGE = [
   '',
   '  --upload --zip PATH  send that zip to the store item as its draft',
   '  --publish            submit the draft for review; it goes out on approval with the visibility the item has',
+  '                       (with --upload, an older version in review is withdrawn so this build takes its place)',
   '  --staged             with --publish: hold the approved package until it is published by hand',
   '  --status             print what is published, what is under review and the last upload\'s state',
   '  --dry-run            print the requests that would be made, send nothing',
@@ -233,6 +279,36 @@ async function waitForUpload({ fetch, name, token, say, sleep }) {
   return false;
 }
 
+// An upload the store refused, read beside the item. The store takes no
+// upload while a review is under way, and a newer build should not wait
+// out an older one's review: so where an older version is in review and
+// this run submits, that review is withdrawn and the caller uploads once
+// more. Anything else ends the run with the store's words. Returns
+// { withdrawn: version } to upload again, or { code } to end the run.
+async function answerRefusal({ fetch, name, token, say, bytes, publish, refusal }) {
+  const status = await call(fetch, statusRequest(name, token));
+  const pending = status.status === 200 && status.body ? versionInReview(status.body) : null;
+  if (pending === null) { say(`${refusal} ${VERSION_ADVICE}`); return { code: 1 }; }
+  const ours = zipVersion(bytes);
+  if (!isVersion(pending) || !ours) {
+    say(`${refusal} Version ${pending || '(not named)'} is in review, and this build's version (${ours || 'unreadable'}) cannot be set beside it, so that review is left alone. Read the dashboard and decide.`);
+    return { code: 1 };
+  }
+  if (compareVersions(ours, pending) <= 0) {
+    say(`${refusal} Version ${pending} is in review and this build (${ours}) is not above it, so that review is left alone. ${VERSION_ADVICE}`);
+    return { code: 1 };
+  }
+  if (!publish) {
+    say(`${refusal} Version ${pending} is in review, and the store takes no upload while a review is under way. This run does not submit, so that review is left alone: wait for it to end, or release again with publish ticked, which withdraws it and submits this build (${ours}) in its place.`);
+    return { code: 1 };
+  }
+  say(`${refusal} Version ${pending} is in review; withdrawing that submission so this build (${ours}) is submitted in its place...`);
+  const cancel = await call(fetch, cancelRequest(name, token));
+  if (cancel.status !== 200) { say(`The store did not withdraw the review of ${pending} (${errorLine(cancel)}). Read the dashboard and decide.`); return { code: 1 }; }
+  say(`The review of ${pending} is withdrawn.`);
+  return { withdrawn: pending };
+}
+
 // Returns the exit code. Everything it needs is passed in so the tests
 // run it with a fake fetch, an environment and a clock of their own.
 export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log = console.log, readFile = fs.readFileSync, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
@@ -261,6 +337,8 @@ export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log =
     say(`Dry run for ${name}:`);
     say(`  POST ${TOKEN_URL} (grant_type=refresh_token)`);
     if (opts.upload) say(`  POST ${uploadRequest(name, '<token>', bytes).url} (${bytes.length} bytes from ${opts.zip}, SHA-256 ${sha256(bytes)})`);
+    if (opts.upload) say(`  GET ${statusRequest(name, '<token>').url}, only if the upload is refused`);
+    if (opts.upload && opts.publish) say(`  POST ${cancelRequest(name, '<token>').url} and the upload again, only if an older version than ${zipVersion(bytes) || 'this build'} is in review`);
     if (opts.publish) say(`  POST ${publishRequest(name, '<token>', { staged: opts.staged }).url}${opts.staged ? ' (STAGED_PUBLISH)' : ''}`);
     if (opts.status) say(`  GET ${statusRequest(name, '<token>').url}`);
     say('Nothing was sent.');
@@ -275,25 +353,37 @@ export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log =
     return 1;
   }
 
+  // Once an older review has been withdrawn, every later stop says so,
+  // since the item then has nothing in review until the person acts.
+  let afterWithdrawal = '';
+  const stop = () => { if (afterWithdrawal) say(afterWithdrawal); return 1; };
+
   if (opts.upload) {
     say(`Uploading ${path.basename(opts.zip)} (${bytes.length} bytes, SHA-256 ${sha256(bytes)}) to ${name}...`);
-    const answer = await call(fetch, uploadRequest(name, token, bytes));
-    if (answer.status !== 200 || !answer.body) { say(`The store refused the upload (${errorLine(answer)}). ${VERSION_ADVICE}`); return 1; }
+    let answer = await call(fetch, uploadRequest(name, token, bytes));
+    if (answer.status !== 200 || !answer.body) {
+      const next = await answerRefusal({ fetch, name, token, say, bytes, publish: opts.publish, refusal: `The store refused the upload (${errorLine(answer)}).` });
+      if (!next.withdrawn) return next.code;
+      afterWithdrawal = `The review of ${next.withdrawn} was withdrawn, so nothing is in review now: answer what the store says, then release again, or upload and submit in the dashboard.`;
+      say(`Uploading ${path.basename(opts.zip)} again...`);
+      answer = await call(fetch, uploadRequest(name, token, bytes));
+      if (answer.status !== 200 || !answer.body) { say(`The store refused the upload (${errorLine(answer)}).`); return stop(); }
+    }
     const said = describeUpload(answer.body);
     say(said.text);
-    if (!said.ok) return 1;
+    if (!said.ok) return stop();
     // A publish right now would submit whatever draft the item holds, so
     // a package still being processed is waited for first, within bounds.
-    if (said.pending && opts.publish && !(await waitForUpload({ fetch, name, token, say, sleep }))) return 1;
+    if (said.pending && opts.publish && !(await waitForUpload({ fetch, name, token, say, sleep }))) return stop();
   }
 
   if (opts.publish) {
     say(`Submitting ${name} for review${opts.staged ? ', to be held on approval' : ''}...`);
     const answer = await call(fetch, publishRequest(name, token, { staged: opts.staged }));
-    if (answer.status !== 200 || !answer.body) { say(`The store refused the submission (${errorLine(answer)}). Nothing to retry from here; read the dashboard and decide.`); return 1; }
+    if (answer.status !== 200 || !answer.body) { say(`The store refused the submission (${errorLine(answer)}). Nothing to retry from here; read the dashboard and decide.`); return stop(); }
     const said = describePublish(answer.body);
     say(said.text);
-    if (!said.ok) return 1;
+    if (!said.ok) return stop();
   }
 
   if (opts.status) {

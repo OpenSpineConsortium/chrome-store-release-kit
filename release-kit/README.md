@@ -29,7 +29,9 @@ What a push to `main` does, once set up:
 5. uploads that same zip to the store item as its draft when the
    repository variable `CWS_ON_PUSH` is `upload`, and submits the draft
    for review as well when it is `publish`; unset or `off`, the release
-   is made and nothing goes to the store.
+   is made and nothing goes to the store. The store takes no upload
+   while a review is under way, so a run that submits withdraws an older
+   build's review first and submits the newer build in its place.
 
 A tag `extension-v<version>` releases the manifest's exact version the
 same way and always uploads it. **Run workflow** in Actions, with
@@ -335,9 +337,15 @@ them.
   nothing automatic at the store beyond the upload and the submit.
 - No retry: an upload the store refuses ends the run with the store's own
   words (the usual cause is a version not above the published one), and
-  the person decides. A package the store is still processing is given
-  five minutes to become the draft before a publish, then the run says
-  how to publish later.
+  the person decides. The one exception is a review under way, during
+  which the store takes no upload: where the version in review is older
+  than the build and the run submits, the run withdraws that review
+  (`cancelSubmission`), uploads once more and submits, so with
+  `CWS_ON_PUSH` at `publish` each push puts its own build in review in
+  place of the one before; a run that only uploads, or a build not above
+  the version in review, leaves the review alone and says so. A package
+  the store is still processing is given five minutes to become the
+  draft before a publish, then the run says how to publish later.
 - No Firefox, Edge or Safari listing; no signed `.crx` (if the item is
   ever opted in to Verified CRX Uploads, the API wants one, which this
   kit does not make; leave that opt-in off).

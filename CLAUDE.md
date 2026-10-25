@@ -41,7 +41,10 @@ manual and the specification; read it first.
 - Plain prose comments that say why; short functions; names that read
   as English. No emoji. Plain ASCII with LF endings in every file.
 - No retry at the store, no shortening of what the store says: an upload
-  the store refuses ends the run with the store's own words.
+  the store refuses ends the run with the store's own words. The one
+  exception, the owner's rule of 2026-10-25: where an older version is in
+  review and the run submits, that review is withdrawn and the upload
+  made once more, so the newer build is submitted in its place.
 
 ## Testing
 
